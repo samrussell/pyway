@@ -64,7 +64,7 @@ class BGPMessageOpen(BGPMessage):
     return message
 
   def __str__(self):
-    return "BGP Open message, version %d AS%d holdtime %d routerid %X optionalparameters length %d" % (self.bgpversion, self.asnum, self.holdtime, self.routerid, self.optionalparameterslength)
+    return "BGP Open message, version %d AS%d holdtime %d routerid %s optionalparameters length %d" % (self.bgpversion, self.asnum, self.holdtime, '.'.join(['%d' % ord(x) for x in struct.pack("!I", self.routerid)]), self.optionalparameterslength)
 
 BGPMessage.factory[1] = BGPMessageOpen
 
@@ -76,20 +76,41 @@ def nlritoprefix(nlrituple):
   return '%s/%d' % (prefix, nlrilen)
 
 class BGPMessageUpdate(BGPMessage):
+
+  pathattributesdecode = {
+        1 : 'ORIGIN',
+        2 : 'AS_PATH',
+        3 : 'NEXT_HOP',
+        4 : 'MULTI_EXIT_DISC',
+        5 : 'LOCAL_PREF',
+        6 : 'ATOMIC_AGGREGATE',
+        7 : 'AGGREGATOR',
+      }
+
   def __init__(self):
     super(BGPMessageUpdate, self).__init__()
     self.length=23
     self.messagetype=2
     self.withdrawnroutes=struct.pack('')
     self.widthdrawnrouteslength=0
+    self.withdrawnrouteslist = []
     self.totalpathattributeslength=0
     self.pathattributes=struct.pack('')
+    self.pathattributesdict={}
     self.nlri=struct.pack('')
     self.nlrilist = []
 
   def encode(self):
     header = super(BGPMessageUpdate, self).encode()
     return header + struct.pack('!H', self.widthdrawnrouteslength) + self.withdrawnroutes + struct.pack('!H', self.totalpathattributeslength) + self.pathattributes + self.nlri
+
+  def decodeattributeflags(self, flags):
+    attributeflags = {}
+    attributeflags['optional'] = 1 if flags & 0x80 > 0 else 0
+    attributeflags['transitive'] = 1 if flags & 0x40 > 0 else 0
+    attributeflags['partial'] = 1 if flags & 0x20 > 0 else 0
+    attributeflags['extendedlength'] = 1 if flags & 0x10 > 0 else 0
+    return attributeflags
 
   @staticmethod
   def decode(payload, length):
@@ -99,14 +120,73 @@ class BGPMessageUpdate(BGPMessage):
     # sanity check withdrawn routes
     if message.withdrawnrouteslength > length-2:
       raise Exception('Withdrawnrouteslength is too damn high')
-    pathattributeoffset = message.widthdrawnrouteslength+2
-    message.widthdrawnroutes = payload[2:pathattributeoffset]
+    pathattributeoffset = message.withdrawnrouteslength+2
+    message.withdrawnroutes = payload[2:pathattributeoffset]
+    # decode withdrawnroutes
+    i = 0
+    while i < len(message.withdrawnroutes):
+      (withdrawnrouteslen, ) = struct.unpack('!B', message.withdrawnroutes[i:i+1])
+      withdrawnroutesbytelen = withdrawnrouteslen/8 + (1 if (withdrawnrouteslen%8 > 0) else 0)
+      i = i+1
+      if withdrawnroutesbytelen+i > len(message.withdrawnroutes):
+        raise Exception('Bad Withdrawnroutes - length is too damn high %d %d %d', withdrawnroutesbytelen, i, len(message.withdrawnroutes))
+      withdrawnroutesprefix = message.withdrawnroutes[i:i+withdrawnroutesbytelen]
+      message.withdrawnrouteslist.append((withdrawnroutesprefix, withdrawnrouteslen))
+      i = i + withdrawnroutesbytelen
+
     (message.totalpathattributeslength,) = struct.unpack('!H', payload[pathattributeoffset:pathattributeoffset+2])
     # sanity check attributes field
     if message.totalpathattributeslength > length-4-message.withdrawnrouteslength:
-      raise Exception('Totalpathattributeslength is too damn high')
+      raise Exception('Totalpathattributeslength is too damn high %d %d %d' % (message.totalpathattributeslength, length, message.withdrawnrouteslength))
     nlrioffset = message.totalpathattributeslength+2+pathattributeoffset
     message.pathattributes = payload[pathattributeoffset+2:nlrioffset]
+    # decode pathattributes
+    i = 0
+    while i < len(message.pathattributes):
+      (flags, code) = struct.unpack('!BB', message.pathattributes[i:i+2])
+      attributeflags = message.decodeattributeflags(flags)
+      i = i + 2
+      if attributeflags['extendedlength']:
+        (attributelength,) = struct.unpack('!H', message.pathattributes[i:i+2])
+        i = i + 2
+      else:
+        (attributelength,) = struct.unpack('!B', message.pathattributes[i:i+1])
+        i = i + 1
+      # do stuff
+      attribute = {}
+      attribute['flags'] = flags
+      attribute['attributeflags'] = attributeflags
+      attribute['code'] = code
+      data = message.pathattributes[i:i+attributelength]
+      attribute['data'] = data
+      # we'll ignore the attributes we don't know - we shouldn't do this (as per the RFC) if they're transitive, but this can be fixed later
+      if code in BGPMessageUpdate.pathattributesdecode:
+        codename = BGPMessageUpdate.pathattributesdecode[code]
+        attribute['codename'] = codename
+        # we know what this is so parse it
+        if code == 1:
+          # ORIGIN
+          # data should be length 1
+          if len(data) != 1:
+            raise Exception('ORIGIN attribute of length %d should be length 1' % len(data))
+          origins = {
+              0 : 'IGP',
+              1 : 'EGP',
+              2 : 'INCOMPLETE'
+              }
+          (dataoctet,) = struct.unpack('!B', data)
+          attribute['parseddata'] = origins[dataoctet]
+        elif code == 2:
+          # AS_PATH
+          # will skip for now, next hop is more useful
+          pass
+        elif code == 3:
+          # NEXT HOP
+          # assume IPv4 and parse out
+          attribute['parseddata'] = '.'.join(['%d' % ord(x) for x in data])
+        #if 'parseddata' in attribute:
+        #  print '%s: %s' % (attribute['codename'], attribute['parseddata'])
+      i = i + attributelength
     message.nlri=payload[nlrioffset:]
     # decode nlri
     i = 0
@@ -122,7 +202,7 @@ class BGPMessageUpdate(BGPMessage):
     return message
 
   def __str__(self):
-    return "BGP Update message, length %d, withdrawnrouteslength %d, pathattributeslength %d nlris: %s" % (self.length, self.withdrawnrouteslength, self.totalpathattributeslength, ','.join([nlritoprefix(x) for x in self.nlrilist]))
+    return "BGP Update message, length %d, withdrawnrouteslength %d, withdrawnroutes: %s pathattributeslength %d nlris: %s" % (self.length, self.withdrawnrouteslength, ','.join([nlritoprefix(x) for x in self.withdrawnrouteslist]), self.totalpathattributeslength, ','.join([nlritoprefix(x) for x in self.nlrilist]))
 
 BGPMessage.factory[2] = BGPMessageUpdate
 
