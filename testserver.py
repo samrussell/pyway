@@ -37,7 +37,7 @@ class MyTCPHandler(SocketServer.BaseRequestHandler):
             packet = self.protocolbuffer[:length]
             self.protocolbuffer = self.protocolbuffer[length:]
             # parse packet
-            message = pyway.lib.bgp.messages.BGPMessage.decode(packet)
+            message = lib.bgp.messages.BGPMessage.decode(packet)
             print message
 
 
